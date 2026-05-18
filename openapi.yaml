@@ -148,6 +148,13 @@ tags:
     description: Actor's spot balance and ledger. Merchant or sub-user context.
   - name: Deposits
     description: Fund the actor's wallet via Gate Pay, on-ramp (card), or self-hosted EVM crypto. Merchant or sub-user context.
+  - name: Partner Payout Custody
+    description: |
+      Separate per-merchant USD-denominated crypto custody (USDT/USDC at MVP). Funds deposited here
+      are **not** spendable in the spot/skin-buying pipeline; they're withdrawable on-chain to any
+      partner-supplied destination. All withdrawals require a synchronous approval callback to the
+      merchant's registered `CallbackUrl` and a partner-supplied `externalId` for idempotency.
+      Toggleable per merchant (`cryptoPayoutEnabled`).
   - name: Market
     description: Catalog search, listings, buy / quick-buy, and the actor's own trades. Merchant or sub-user context.
   - name: WebSocket
@@ -680,6 +687,191 @@ components:
           description: Map of `CryptoEvmChain` → preview (fees, gas, receive amount).
 
     # ─────────────────────────────────────────────────────────────────────
+    # Partner crypto payout custody
+    # ─────────────────────────────────────────────────────────────────────
+    PayoutCryptoToken:
+      type: string
+      enum: [USDT, USDC]
+      description: Stables only at MVP.
+
+    PayoutWithdrawalStatus:
+      type: string
+      enum: [pending_callback, queued, broadcast, confirmed, failed, refunded]
+      description: |
+        Lifecycle: `pending_callback` → (approval callback returns 2xx) → `queued` →
+        `broadcast` → `confirmed`. On callback rejection or permanent broadcast failure:
+        `failed` + `refunded` (sidecar re-credited, ledger reversed).
+
+    PayoutCryptoAddressResponse:
+      type: object
+      required: [address, chains, tokens]
+      description: |
+        Distinct from the spot deposit forwarder (`/deposit/crypto/address`). Funds sent to the
+        payout address credit the partner's payout custody balance, **not** the spot wallet.
+      properties:
+        address:
+          type: string
+          pattern: '^0x[a-fA-F0-9]{40}$'
+          description: Same EVM address across all supported chains (CREATE2).
+        chains:
+          type: array
+          items: { $ref: '#/components/schemas/CryptoEvmChain' }
+        tokens:
+          type: array
+          items: { $ref: '#/components/schemas/PayoutCryptoToken' }
+
+    PayoutCryptoBalance:
+      type: object
+      required: [chain, token, tokenAddress, balanceCents]
+      properties:
+        chain: { type: string, example: ethereum }
+        token: { type: string, example: USDC }
+        tokenAddress:
+          type: string
+          description: ERC-20 contract address for this token on this chain (lowercased).
+        balanceCents:
+          type: string
+          description: USD cents, bigint as decimal string.
+
+    PayoutBalancesResponse:
+      type: object
+      required: [balances]
+      properties:
+        balances:
+          type: array
+          items: { $ref: '#/components/schemas/PayoutCryptoBalance' }
+
+    PayoutQuoteBody:
+      type: object
+      required: [chain, token, amountCents]
+      additionalProperties: false
+      properties:
+        chain: { $ref: '#/components/schemas/CryptoEvmChain' }
+        token: { $ref: '#/components/schemas/PayoutCryptoToken' }
+        amountCents:
+          type: string
+          pattern: '^\d+$'
+          description: USD cents the destination should receive, bigint as decimal string.
+
+    PayoutQuoteStats24h:
+      type: object
+      required: [minFeeUsdCents, p25FeeUsdCents, avgFeeUsdCents, p75FeeUsdCents, maxFeeUsdCents]
+      description: |
+        Network fee distribution over the last ~24h derived from `eth_feeHistory`
+        (1024 blocks). All values already multiplied by the configured fee multiplier.
+        L2 chains: all stats are `"0"` and the response shape stays stable.
+      properties:
+        minFeeUsdCents: { type: string }
+        p25FeeUsdCents: { type: string }
+        avgFeeUsdCents: { type: string }
+        p75FeeUsdCents: { type: string }
+        maxFeeUsdCents: { type: string }
+
+    PayoutQuoteResponse:
+      type: object
+      required: [chain, token, amountCents, feeMultiplier, liveFeeUsdCents, liveTotalDebitCents, stats24h, computedAt]
+      properties:
+        chain: { type: string }
+        token: { type: string }
+        amountCents: { type: string }
+        feeMultiplier:
+          type: number
+          description: Admin-configurable multiplier on live gas (default 1.5).
+        liveFeeUsdCents:
+          type: string
+          description: Current network fee in USD cents (live gas × multiplier).
+        liveTotalDebitCents:
+          type: string
+          description: '`amountCents + liveFeeUsdCents` — what would be deducted from the payout custody if the partner submitted now.'
+        stats24h: { $ref: '#/components/schemas/PayoutQuoteStats24h' }
+        computedAt: { type: string, format: date-time }
+
+    PayoutWithdrawBody:
+      type: object
+      required: [chain, token, destination, amountCents, externalId]
+      additionalProperties: false
+      properties:
+        chain: { $ref: '#/components/schemas/CryptoEvmChain' }
+        token: { $ref: '#/components/schemas/PayoutCryptoToken' }
+        destination:
+          type: string
+          pattern: '^0x[a-fA-F0-9]{40}$'
+          description: EVM address that will receive the funds on-chain.
+        amountCents:
+          type: string
+          pattern: '^\d+$'
+          description: USD cents to send to the destination. Fee is added on top and debited together.
+        externalId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Partner-supplied reference. Echoed in the approval callback and all lifecycle events so
+            you can match against your own records. Must be unique per merchant; duplicate ⇒ `1824`.
+        forSubUser:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Optional label — sub-user `id` (UUID) or your `externalId` for that sub-user, scoped
+            to the calling merchant. **Pure label, not auth scope:** funding always comes from
+            the merchant's payout custody; the sub-user reference is recorded for audit and
+            echoed in the approval callback / lifecycle events.
+        maxFeeUsdCents:
+          type: string
+          pattern: '^\d+$'
+          description: |
+            Optional fee cap. If the live fee at submission exceeds this cap, the request is
+            rejected with `1821` and no state is mutated. Useful for declining high-gas moments.
+
+    PayoutWithdrawResponse:
+      type: object
+      required: [id, status, chain, token, destination, amountCents, feeCents, externalId, forUserId, forUserExternalId, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/PayoutWithdrawalStatus' }
+        chain: { type: string }
+        token: { type: string }
+        destination: { type: string }
+        amountCents: { type: string }
+        feeCents: { type: string }
+        externalId: { type: string }
+        forUserId: { type: [string, "null"], format: uuid }
+        forUserExternalId: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+
+    PayoutWithdrawalDetail:
+      type: object
+      required: [id, status, amountCents, feeCents, callbackAttempts, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/PayoutWithdrawalStatus' }
+        chain: { type: [string, "null"] }
+        token: { type: [string, "null"] }
+        tokenAddress: { type: [string, "null"] }
+        destination: { type: [string, "null"] }
+        amountCents: { type: string }
+        feeCents: { type: string }
+        txHash: { type: [string, "null"] }
+        failureReason: { type: [string, "null"] }
+        externalId: { type: [string, "null"] }
+        forUserId: { type: [string, "null"], format: uuid }
+        forUserExternalId: { type: [string, "null"] }
+        callbackAttempts: { type: integer }
+        createdAt: { type: string, format: date-time }
+        broadcastAt: { type: [string, "null"], format: date-time }
+        confirmedAt: { type: [string, "null"], format: date-time }
+
+    PayoutWithdrawalListResponse:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PayoutWithdrawalDetail' }
+        nextCursor: { type: [string, "null"] }
+
+    # ─────────────────────────────────────────────────────────────────────
     # Universal deposit cancel/resume
     # ─────────────────────────────────────────────────────────────────────
     CancelDepositResponse:
@@ -1059,13 +1251,7 @@ components:
       type: object
       required: [id, name, marketHashName, type, iconUrl, price]
       properties:
-        id:
-          type: string
-          format: uuid
-          description: >
-            Listing id — the same id returned by listing endpoints
-            (`GET /market/items/{itemId}/listings`, `GET /market/listings/{id}`).
-            Use this id when calling the cancel endpoint.
+        id: { type: string }
         name: { type: [string, "null"] }
         marketHashName: { type: [string, "null"] }
         type: { type: [string, "null"] }
@@ -1156,12 +1342,10 @@ components:
 
     CancelItemResponse:
       type: object
-      required: [itemId, status]
+      required: [ok, itemId, status]
       properties:
-        itemId:
-          type: string
-          format: uuid
-          description: Listing id of the cancelled item — same id you passed in the URL.
+        ok: { type: boolean, enum: [true] }
+        itemId: { type: string, format: uuid }
         status: { type: string, enum: [cancelled, failed] }
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2292,6 +2476,237 @@ paths:
         '429': { $ref: '#/components/responses/RateLimited' }
 
   # ─────────────────────────────────────────────────────────────────────
+  # PARTNER CRYPTO PAYOUT CUSTODY
+  # ─────────────────────────────────────────────────────────────────────
+  /user/wallet/payout/crypto/address:
+    get:
+      operationId: getPayoutCryptoAddress
+      tags: [Partner Payout Custody]
+      summary: Get the merchant's payout deposit address
+      description: |
+        **Auth context:** merchant — no `On-Behalf-Of`. Requires `cryptoPayoutEnabled=true`.
+
+        Returns a **distinct** EVM forwarder address dedicated to partner-custody deposits.
+        Funds sent here are credited to the merchant's payout balance (per-(chain, token)
+        sidecar), **not** the spot wallet. This address is allocated lazily on first call
+        and cached forever.
+
+        Confirm before depositing: this is different from `/deposit/crypto/address` even
+        though both are CREATE2 forwarders derived for the same merchant.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PayoutCryptoAddressResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `1820 CRYPTO_PAYOUT_NOT_ENABLED` — merchant doesn't have payout custody enabled.
+
+  /user/wallet/payout/crypto/balances:
+    get:
+      operationId: getPayoutCryptoBalances
+      tags: [Partner Payout Custody]
+      summary: List per-(chain, token) payout custody balances
+      description: |
+        **Auth context:** merchant. Requires `cryptoPayoutEnabled=true`.
+
+        Source of truth for what can be withdrawn on each chain. The aggregate USD balance
+        also lives in the merchant's `payout_crypto` wallet (one ledger account, one currency),
+        but the breakdown by chain × token only exists here.
+
+        > **Each (chain, token) row is an independent withdrawable bucket.** SkinShark does
+        > not hold cross-chain liquidity — funds deposited on chain X / token Y can only
+        > be withdrawn on chain X / token Y.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PayoutBalancesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`1820 CRYPTO_PAYOUT_NOT_ENABLED`'
+
+  /user/wallet/payout/crypto/withdraw/quote:
+    post:
+      operationId: quotePayoutCryptoWithdrawal
+      tags: [Partner Payout Custody]
+      summary: Preview live network fee + 24h gas distribution
+      description: |
+        **Auth context:** merchant. Requires `cryptoPayoutEnabled=true`. **Rate limit: 60/min.**
+
+        Returns the current network fee (`liveFeeUsdCents`) plus a min/p25/avg/p75/max
+        distribution over the last ~24h so you can decide whether *now* is a good moment.
+        Purely advisory — no state is mutated.
+
+        On L2 chains (Base, Arbitrum, Optimism), fees are `"0"` and stats are all `"0"`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutQuoteBody' }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PayoutQuoteResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: '`1820 CRYPTO_PAYOUT_NOT_ENABLED`' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /user/wallet/payout/crypto/withdraw:
+    post:
+      operationId: createPayoutCryptoWithdrawal
+      tags: [Partner Payout Custody]
+      summary: Initiate a payout withdrawal
+      description: |
+        **Auth context:** merchant — **API key only** (JWT not accepted; this is the one
+        write endpoint in the payout group). Requires `cryptoPayoutEnabled=true` and at
+        least one active `CallbackUrl` registered for the merchant.
+
+        > **Withdrawals are per (chain, token), not from a single pool.** SkinShark does
+        > not hold cross-chain liquidity. You can only withdraw from a chain × token
+        > combination you previously deposited to. Depositing USDC on Base and asking to
+        > withdraw USDC on Ethereum will fail with `1822 CRYPTO_PAYOUT_INSUFFICIENT_BALANCE`
+        > even if you have plenty of USDC on Base. Use `GET /payout/crypto/balances` to
+        > see what's withdrawable on each chain.
+
+        Flow:
+        1. Live fee computed; rejected with `1821` if `maxFeeUsdCents` is set and the live
+           fee exceeds it. No state mutated.
+        2. Atomic transaction: sidecar decremented by `amountCents + liveFeeUsdCents`
+           (rejected with `1822` if insufficient), `payout_withdraw_lock` ledger posting,
+           withdrawal row created in `pending_callback`.
+        3. Synchronous approval callback POSTed to your `CallbackUrl` (5s timeout). Must
+           return 2xx. See **`payout.crypto.withdraw.approval`** in the webhook event
+           reference for the signed payload contract.
+        4. On 2xx → `queued` → `broadcast` → `confirmed`. On 4xx → immediate refund +
+           `failed` + `refunded` events. On 5xx/timeout/network → retry up to 3 times,
+           then refund.
+        5. Lifecycle events (`broadcast`, `confirmed`, `failed`, `refunded`) delivered
+           via the standard signed webhook queue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutWithdrawBody' }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PayoutWithdrawResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `1820 CRYPTO_PAYOUT_NOT_ENABLED` — merchant flag is off.
+        '409':
+          description: |
+            `1824 CRYPTO_PAYOUT_DUPLICATE_EXTERNAL_ID` — `externalId` already used
+            for this merchant (idempotency violation).
+        '422':
+          description: |
+            One of:
+            - `1010 INVALID_AMOUNT` — `amountCents` not a positive integer.
+            - `1803 CRYPTO_TOKEN_NOT_SUPPORTED` — token not in MVP allow-list for the chain.
+            - `1806 CRYPTO_INVALID_DESTINATION` — destination is zero address, treasury,
+              or one of the merchant's own forwarders.
+            - `1821 CRYPTO_PAYOUT_FEE_EXCEEDS_MAX` — live fee > `maxFeeUsdCents`.
+            - `1822 CRYPTO_PAYOUT_INSUFFICIENT_BALANCE` — sidecar < `amountCents + fee`.
+            - `1823 CRYPTO_PAYOUT_NO_CALLBACK_URL` — no active `CallbackUrl` registered.
+            - `1825 CRYPTO_PAYOUT_INVALID_SUBUSER` — `forSubUser` doesn't resolve to a
+              sub-user of the calling merchant.
+
+  /user/wallet/payout/crypto/withdrawals:
+    get:
+      operationId: listPayoutCryptoWithdrawals
+      tags: [Partner Payout Custody]
+      summary: List payout withdrawals
+      description: |
+        **Auth context:** merchant. Requires `cryptoPayoutEnabled=true`.
+
+        Cursor-paginated, most-recent first. Filter by status, chain, or `forUserId`
+        (the sub-user UUID stamped at create time, not the partner externalId).
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/PayoutWithdrawalStatus' }
+        - name: chain
+          in: query
+          schema: { $ref: '#/components/schemas/CryptoEvmChain' }
+        - name: forUserId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PayoutWithdrawalListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: '`1820 CRYPTO_PAYOUT_NOT_ENABLED`' }
+
+  /user/wallet/payout/crypto/withdrawals/{id}:
+    get:
+      operationId: getPayoutCryptoWithdrawal
+      tags: [Partner Payout Custody]
+      summary: Fetch a single payout withdrawal
+      description: |
+        **Auth context:** merchant. Returns full detail including current status, on-chain
+        txHash (once `broadcast`), failure reason, and callback retry count.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PayoutWithdrawalDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: '`1807 CRYPTO_WITHDRAWAL_NOT_FOUND`'
+
+  # ─────────────────────────────────────────────────────────────────────
   # SUB-USER DEPOSITS — Universal cancel/resume
   # ─────────────────────────────────────────────────────────────────────
   /user/wallet/deposit/{id}/cancel:
@@ -2668,11 +3083,7 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/OnBehalfOf' }
         - { name: tradeId, in: path, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
-        - name: itemId
-          in: path
-          required: true
-          description: Listing id of the item to cancel — the `id` returned in `Trade.items[].id` and from listing endpoints.
-          schema: { type: string, format: uuid }
+        - { name: itemId, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         '200':
           description: OK.

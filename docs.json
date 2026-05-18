@@ -42,6 +42,7 @@
             "pages": [
               "integration/core-api",
               "integration/full-platform",
+              "integration/partner-crypto-payout",
               "guides/sdk"
             ]
           },

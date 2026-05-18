@@ -47,6 +47,60 @@ Deposit lifecycle:
 - `deposit.refunded`
 - `deposit.cancelled`
 
+Partner crypto payout custody:
+
+- `payout.crypto.deposit.completed` — a deposit landed in the partner's payout custody (per-(chain, token) sidecar credited). **Distinct from `deposit.completed`** — the latter is for spot wallet credits.
+- `payout.crypto.withdraw.approval` — **synchronous approval gate**, see below. Special delivery semantics.
+- `payout.crypto.withdraw.broadcast` — withdrawal broadcast on-chain. Includes `txHash` and `nonce`.
+- `payout.crypto.withdraw.confirmed` — final confirmation reached.
+- `payout.crypto.withdraw.failed` — terminally failed (approval rejected, or broadcast permanently failed).
+- `payout.crypto.withdraw.refunded` — sidecar re-credited, payout wallet restored. Always paired with `failed` — partners can rely on either to know funds returned.
+
+## The approval callback — synchronous, not queued
+
+`payout.crypto.withdraw.approval` is **fundamentally different** from every other event in this guide:
+
+| Property | Approval callback | All other events |
+|---|---|---|
+| Delivery | Direct HTTP POST from the worker | Queued via the standard webhook processor |
+| Timeout | **5 seconds** | 10 seconds + retries |
+| Required response | **2xx within timeout** | 2xx eventually, retried otherwise |
+| Failure mode | Explicit 4xx → immediate refund. 5xx/timeout/network → up to 3 retries, then refund. | Retried 11 times over ~15h |
+| Signature scheme | Same Standard Webhooks signing (using your active webhook secret) | Same |
+| Purpose | **Gate** the withdrawal — your 2xx is the merchant-side "yes, I authorized this" | Notify after-the-fact |
+
+When your server receives `payout.crypto.withdraw.approval`:
+
+1. Verify the signature (same scheme as every other event).
+2. Look up `externalId` in your records. If you didn't create this withdrawal — respond **4xx immediately** to refund.
+3. If you did create it, confirm the destination, amount, and `forUserExternalId` match what you expect.
+4. Return 2xx within 5 seconds → the worker proceeds to `queued` → `broadcast`.
+5. Return 4xx → withdrawal is immediately refunded.
+
+If you simply forgot to register a callback URL, the withdrawal fails with `1823 CRYPTO_PAYOUT_NO_CALLBACK_URL` at submission time — it never reaches this stage.
+
+### Approval payload shape
+
+```json
+{
+  "event": "payout.crypto.withdraw.approval",
+  "withdrawalId": "8a3f...",
+  "externalId": "merchant-ref-001",
+  "forUserId": "uuid-or-null",
+  "forUserExternalId": "your-subuser-ref-or-null",
+  "chain": "ethereum",
+  "token": "USDC",
+  "tokenAddress": "0xa0b8...",
+  "destination": "0x...",
+  "amountCents": "100000",
+  "feeUsdCents": "247",
+  "createdAt": "2026-05-18T12:34:56.000Z",
+  "nonce": "...-uuid"
+}
+```
+
+The async lifecycle events (`payout.crypto.withdraw.broadcast`, `.confirmed`, `.failed`, `.refunded`) carry a `withdrawal` object instead — same shape as `GET /payout/crypto/withdrawals/{id}` plus the resolved `forUserExternalId`.
+
 ## Envelope
 
 Every delivery body is JSON in this shape:
@@ -61,9 +115,19 @@ interface WebhookEnvelope {
         trade: Trade;                   // same shape as GET /merchant/trades/{id}
         settlement?: { houseFeeCents: number; merchantFeeCents: number };
       }
-    | { deposit: Deposit };
+    | { deposit: Deposit }
+    | {
+        deposit: Deposit;
+        forUserExternalId: string | null;
+      }                                  // payout.crypto.deposit.completed
+    | {
+        withdrawal: PayoutWithdrawal;    // shape mirrors GET /payout/crypto/withdrawals/{id}
+      };                                 // payout.crypto.withdraw.{broadcast,confirmed,failed,refunded}
 }
 ```
+
+The synchronous **approval** callback (`payout.crypto.withdraw.approval`) is a different
+shape entirely — see the section above for its payload.
 
 Trade events carry the same `Trade` object you'd get from the trade
 detail endpoint — `id`, `status`, `currency`, `totalPrice`, full
