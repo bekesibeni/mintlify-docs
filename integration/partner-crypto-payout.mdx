@@ -198,31 +198,47 @@ your callback URL.
 ## The approval callback (the 2FA gate)
 
 Within ~1 second of accepting your `/withdraw` request, our worker POSTs
-to your registered callback URL:
+to your registered callback URL. The body uses the **same envelope shape**
+as every other webhook event:
 
 ```json
 {
-  "event": "payout.crypto.withdraw.approval",
-  "withdrawalId": "8a3f...",
-  "externalId": "payout-2026-05-18-001",
-  "forUserId": "uuid-of-sub-user",
-  "forUserExternalId": "your-end-user-id",
-  "chain": "ethereum",
-  "token": "USDC",
-  "tokenAddress": "0xa0b86991...",
-  "destination": "0xrecipient...",
-  "amountCents": "100000",
-  "feeUsdCents": "247",
+  "id": "01HF3K6...",
+  "type": "payout.crypto.withdraw.approval",
   "createdAt": "2026-05-18T12:34:57.123Z",
-  "nonce": "uuid"
+  "data": {
+    "withdrawal": {
+      "id": "8a3f...",
+      "userId": "...",
+      "externalId": "payout-2026-05-18-001",
+      "forUserId": "uuid-of-sub-user",
+      "forUserExternalId": "your-end-user-id",
+      "status": "pending_callback",
+      "chain": "ethereum",
+      "token": "USDC",
+      "tokenAddress": "0xa0b86991...",
+      "destination": "0xrecipient...",
+      "amountCents": 100000,
+      "feeCents": 247,
+      "amountWei": "100000000",
+      "txHash": null,
+      "failureReason": null,
+      "callbackAttempts": 0,
+      "createdAt": "2026-05-18T12:34:57.123Z",
+      "broadcastAt": null,
+      "confirmedAt": null
+    }
+  }
 }
 ```
 
 **Signature:** same `webhook-id` / `webhook-timestamp` / `webhook-signature`
-scheme as every other event. Verify on the raw body.
+scheme as every other event. Verify on the raw body. Because the envelope
+matches, one verifier handles approval and lifecycle events alike — dispatch
+on `event.type`.
 
-**Your job:** look up `externalId` in your records. Confirm you created
-this withdrawal with these exact parameters. Return:
+**Your job:** look up `data.withdrawal.externalId` in your records. Confirm
+you created this withdrawal with these exact parameters. Return:
 
 - **2xx within 5 seconds** → withdrawal proceeds to `queued` → `broadcast` → `confirmed`.
 - **4xx** → withdrawal is immediately refunded. Sidecar restored. `payout_withdraw_refund` ledger entry posted.
@@ -248,16 +264,17 @@ app.post(
       throw e;
     }
 
-    if (event.event === "payout.crypto.withdraw.approval") {
+    if (event.type === "payout.crypto.withdraw.approval") {
+      const w = event.data.withdrawal;
       const ourRecord = await db.payouts.findUnique({
-        where: { externalId: event.externalId },
+        where: { externalId: w.externalId },
       });
       if (!ourRecord) return res.status(404).end();   // unknown → refund
       if (
-        ourRecord.destination.toLowerCase() !== event.destination.toLowerCase() ||
-        ourRecord.amountCents !== event.amountCents ||
-        ourRecord.chain !== event.chain ||
-        ourRecord.token !== event.token
+        ourRecord.destination.toLowerCase() !== w.destination.toLowerCase() ||
+        ourRecord.amountCents !== w.amountCents ||
+        ourRecord.chain !== w.chain ||
+        ourRecord.token !== w.token
       ) {
         return res.status(400).end();                 // mismatch → refund
       }
@@ -273,22 +290,24 @@ app.post(
 ## Lifecycle events
 
 After approval (or rejection), you get standard signed webhooks for the
-lifecycle:
+lifecycle — **same envelope as the approval callback**:
 
 | Event | Fired when | Carries |
 |---|---|---|
-| `payout.crypto.deposit.completed` | A deposit credited your payout custody | `deposit` object |
-| `payout.crypto.withdraw.broadcast` | On-chain transaction submitted | `withdrawal` with `txHash` |
-| `payout.crypto.withdraw.confirmed` | Final confirmation reached | `withdrawal` with `txHash` |
-| `payout.crypto.withdraw.failed` | Approval rejected or broadcast permanently failed | `withdrawal` with `failureReason` |
-| `payout.crypto.withdraw.refunded` | Sidecar re-credited; paired with `failed` | `withdrawal` |
+| `payout.crypto.deposit.completed` | A deposit credited your payout custody | `data.deposit` + `data.forUserExternalId` |
+| `payout.crypto.withdraw.broadcast` | On-chain transaction submitted | `data.withdrawal` with `txHash` |
+| `payout.crypto.withdraw.confirmed` | Final confirmation reached | `data.withdrawal` with `txHash` |
+| `payout.crypto.withdraw.failed` | Approval rejected or broadcast permanently failed | `data.withdrawal` with `failureReason` |
+| `payout.crypto.withdraw.refunded` | Sidecar re-credited; paired with `failed` | `data.withdrawal` |
 
 These follow the **standard** webhook delivery rules from
 [Webhooks](/guides/webhooks): 11 retries over ~15h, auto-disable on 72h
 continuous failure, signed with your webhook secret.
 
-The synchronous `approval` callback is the **odd one out** — it does **not**
-go through this queue. See the Webhooks guide for the comparison table.
+The synchronous `approval` callback uses the same body and signing scheme
+but **bypasses the retry queue**: the worker POSTs directly, 5 s timeout,
+3 retries on transient failure, then refund. See the Webhooks guide for
+the full comparison table.
 
 ## Polling status as a fallback
 

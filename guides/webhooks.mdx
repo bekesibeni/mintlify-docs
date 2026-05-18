@@ -58,22 +58,28 @@ Partner crypto payout custody:
 
 ## The approval callback — synchronous, not queued
 
-`payout.crypto.withdraw.approval` is **fundamentally different** from every other event in this guide:
+`payout.crypto.withdraw.approval` uses the **same envelope, headers, and signature scheme** as
+every other event — only the delivery semantics differ:
 
 | Property | Approval callback | All other events |
 |---|---|---|
+| Body shape | Same `{ id, type, createdAt, data }` envelope | Same |
+| Headers + signature | `webhook-id` / `webhook-timestamp` / `webhook-signature`, HMAC-SHA256 | Same |
 | Delivery | Direct HTTP POST from the worker | Queued via the standard webhook processor |
 | Timeout | **5 seconds** | 10 seconds + retries |
 | Required response | **2xx within timeout** | 2xx eventually, retried otherwise |
 | Failure mode | Explicit 4xx → immediate refund. 5xx/timeout/network → up to 3 retries, then refund. | Retried 11 times over ~15h |
-| Signature scheme | Same Standard Webhooks signing (using your active webhook secret) | Same |
 | Purpose | **Gate** the withdrawal — your 2xx is the merchant-side "yes, I authorized this" | Notify after-the-fact |
+
+Because the envelope and signing match every other event, one handler with one Standard
+Webhooks verifier can ingest approvals alongside lifecycle events — just dispatch on
+`event.type === 'payout.crypto.withdraw.approval'` to apply the synchronous behavior below.
 
 When your server receives `payout.crypto.withdraw.approval`:
 
 1. Verify the signature (same scheme as every other event).
-2. Look up `externalId` in your records. If you didn't create this withdrawal — respond **4xx immediately** to refund.
-3. If you did create it, confirm the destination, amount, and `forUserExternalId` match what you expect.
+2. Look up `data.withdrawal.externalId` in your records. If you didn't create this withdrawal — respond **4xx immediately** to refund.
+3. If you did create it, confirm `destination`, `amountCents`, and `forUserExternalId` match what you expect.
 4. Return 2xx within 5 seconds → the worker proceeds to `queued` → `broadcast`.
 5. Return 4xx → withdrawal is immediately refunded.
 
@@ -83,31 +89,46 @@ If you simply forgot to register a callback URL, the withdrawal fails with `1823
 
 ```json
 {
-  "event": "payout.crypto.withdraw.approval",
-  "withdrawalId": "8a3f...",
-  "externalId": "merchant-ref-001",
-  "forUserId": "uuid-or-null",
-  "forUserExternalId": "your-subuser-ref-or-null",
-  "chain": "ethereum",
-  "token": "USDC",
-  "tokenAddress": "0xa0b8...",
-  "destination": "0x...",
-  "amountCents": "100000",
-  "feeUsdCents": "247",
+  "id": "01HF3K6...",
+  "type": "payout.crypto.withdraw.approval",
   "createdAt": "2026-05-18T12:34:56.000Z",
-  "nonce": "...-uuid"
+  "data": {
+    "withdrawal": {
+      "id": "8a3f...",
+      "userId": "...",
+      "externalId": "merchant-ref-001",
+      "forUserId": "uuid-or-null",
+      "forUserExternalId": "your-subuser-ref-or-null",
+      "status": "pending_callback",
+      "chain": "ethereum",
+      "token": "USDC",
+      "tokenAddress": "0xa0b8...",
+      "destination": "0x...",
+      "amountCents": 100000,
+      "feeCents": 247,
+      "amountWei": "100000000",
+      "txHash": null,
+      "failureReason": null,
+      "callbackAttempts": 0,
+      "createdAt": "2026-05-18T12:34:56.000Z",
+      "broadcastAt": null,
+      "confirmedAt": null
+    }
+  }
 }
 ```
 
-The async lifecycle events (`payout.crypto.withdraw.broadcast`, `.confirmed`, `.failed`, `.refunded`) carry a `withdrawal` object instead — same shape as `GET /payout/crypto/withdrawals/{id}` plus the resolved `forUserExternalId`.
+The async lifecycle events (`payout.crypto.withdraw.broadcast`, `.confirmed`, `.failed`,
+`.refunded`) carry the **exact same** `data.withdrawal` shape — only `status`, `txHash`,
+`broadcastAt`, `confirmedAt`, and `failureReason` differ across the lifecycle.
 
 ## Envelope
 
-Every delivery body is JSON in this shape:
+Every delivery body is JSON in this shape — including the synchronous approval callback:
 
 ```ts
 interface WebhookEnvelope {
-  id: string;                 // delivery UUID v7 — same value as `webhook-id` header
+  id: string;                 // delivery UUID — same value as `webhook-id` header
   type: string;               // event type, e.g. "trade.completed"
   createdAt: string;          // ISO-8601
   data:
@@ -122,12 +143,9 @@ interface WebhookEnvelope {
       }                                  // payout.crypto.deposit.completed
     | {
         withdrawal: PayoutWithdrawal;    // shape mirrors GET /payout/crypto/withdrawals/{id}
-      };                                 // payout.crypto.withdraw.{broadcast,confirmed,failed,refunded}
+      };                                 // payout.crypto.withdraw.{approval,broadcast,confirmed,failed,refunded}
 }
 ```
-
-The synchronous **approval** callback (`payout.crypto.withdraw.approval`) is a different
-shape entirely — see the section above for its payload.
 
 Trade events carry the same `Trade` object you'd get from the trade
 detail endpoint — `id`, `status`, `currency`, `totalPrice`, full
