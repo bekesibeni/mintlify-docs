@@ -109,8 +109,8 @@ combination you've ever deposited to.
 
 ### Preview the fee first
 
-The withdrawal fee is `liveGasPrice × multiplier` (multiplier is 1.5×
-by default, admin-configurable). On L2 chains the fee is 0.
+The withdrawal fee reflects current network gas. On L2 chains (Base,
+Arbitrum, Optimism) the fee is `0`.
 
 ```http
 POST /user/wallet/payout/crypto/withdraw/quote
@@ -124,7 +124,6 @@ Content-Type: application/json
   "chain": "ethereum",
   "token": "USDC",
   "amountCents": "100000",
-  "feeMultiplier": 1.5,
   "liveFeeUsdCents": "247",
   "liveTotalDebitCents": "100247",
   "stats24h": {
@@ -297,8 +296,7 @@ lifecycle — **same envelope as the approval callback**:
 | `payout.crypto.deposit.completed` | A deposit credited your payout custody | `data.deposit` + `data.forUserExternalId` |
 | `payout.crypto.withdraw.broadcast` | On-chain transaction submitted | `data.withdrawal` with `txHash` |
 | `payout.crypto.withdraw.confirmed` | Final confirmation reached | `data.withdrawal` with `txHash` |
-| `payout.crypto.withdraw.failed` | Approval rejected or broadcast permanently failed | `data.withdrawal` with `failureReason` |
-| `payout.crypto.withdraw.refunded` | Sidecar re-credited; paired with `failed` | `data.withdrawal` |
+| `payout.crypto.withdraw.refunded` | Any rejection, failure, or on-chain revert — sidecar re-credited, ledger reversed. The single terminal failure event (no separate `.failed`). | `data.withdrawal` with `failureReason` |
 
 These follow the **standard** webhook delivery rules from
 [Webhooks](/guides/webhooks): 11 retries over ~15h, auto-disable on 72h
@@ -352,8 +350,10 @@ After integrating, run these against the testnet:
    received funds — the flag never re-routes in-flight deposits.)
 4. Quote → withdraw with a mock callback returning 200. Status progresses
    `queued → broadcast → confirmed`. Tx visible at destination.
-5. Quote → withdraw with a mock callback returning 403. After 3 retries:
-   `failed` + `refunded`, sidecar restored, payout wallet balance restored.
-6. Re-submit the same `externalId` → `1824`.
+5. Quote → withdraw with a mock callback returning 403 → immediate
+   `refunded`, sidecar restored, payout wallet balance restored. (A 5xx /
+   timeout retries up to 3 times before the same `refunded` outcome.)
+6. Re-submit the same `externalId` → returns the **original** withdrawal
+   (idempotent replay), not a new one or an error.
 7. `maxFeeUsdCents: "1"` → `1821`.
 8. `amountCents` larger than your (chain, token) balance → `1822`.

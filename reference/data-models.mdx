@@ -595,8 +595,7 @@ interface PayoutQuoteResponse {
   chain: string;
   token: string;
   amountCents: string;
-  feeMultiplier: number;            // 1.5 by default; admin-configurable
-  liveFeeUsdCents: string;          // live gas × multiplier
+  liveFeeUsdCents: string;          // live network gas; "0" on L2 chains
   liveTotalDebitCents: string;      // amountCents + liveFeeUsdCents
   stats24h: PayoutQuoteStats24h;
   computedAt: string;               // ISO-8601

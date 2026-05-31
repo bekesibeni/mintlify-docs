@@ -179,7 +179,7 @@ Self-hosted EVM deposit/withdrawal/transfer.
 | 1810 | `CRYPTO_SELF_TRANSFER` | 422 | Cannot transfer to your own wallet. |
 | 1811 | `CRYPTO_RECIPIENT_WALLET_MISSING` | 422 | Recipient has no wallet for this currency. |
 
-## Partner crypto payout custody (1820–1825)
+## Partner crypto payout custody (1820–1827)
 
 | Code | Key | HTTP | Notes |
 |---|---|---|---|
@@ -187,8 +187,10 @@ Self-hosted EVM deposit/withdrawal/transfer.
 | 1821 | `CRYPTO_PAYOUT_FEE_EXCEEDS_MAX` | 422 | Live fee at submission exceeds the merchant-supplied `maxFeeUsdCents`. No state mutated. |
 | 1822 | `CRYPTO_PAYOUT_INSUFFICIENT_BALANCE` | 422 | Per-(chain, token) sidecar balance is below `amountCents + fee`. Each chain × token is an independent bucket — no cross-chain liquidity. |
 | 1823 | `CRYPTO_PAYOUT_NO_CALLBACK_URL` | 422 | No active `CallbackUrl` registered for the merchant. Approval callbacks need somewhere to land before any withdrawal can proceed. |
-| 1824 | `CRYPTO_PAYOUT_DUPLICATE_EXTERNAL_ID` | 409 | Re-using an `externalId`. Each merchant has a `(userId, externalId)` unique constraint — pick a fresh value per withdrawal. |
+| 1824 | `CRYPTO_PAYOUT_DUPLICATE_EXTERNAL_ID` | 409 | Only on a **genuine concurrent duplicate** racing the first create. A normal retry of the same `externalId` returns the original withdrawal (idempotent replay), not this error. |
 | 1825 | `CRYPTO_PAYOUT_INVALID_SUBUSER` | 422 | `forSubUser` doesn't resolve to a sub-user owned by the calling merchant. The value can be the sub-user's UUID or your `externalId`, but only within your own children. |
+| 1826 | `CRYPTO_PAYOUT_FEE_UNAVAILABLE` | 503 | The gas/price oracle is temporarily down on a fee chain. Fail-closed — retry shortly. |
+| 1827 | `CRYPTO_PAYOUT_NO_SIGNING_KEY` | 422 | A webhook signing secret must be provisioned before requesting payouts, so the approval call can be signed. |
 
 ## Merchant management (1900–1950)
 

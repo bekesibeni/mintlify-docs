@@ -696,11 +696,12 @@ components:
 
     PayoutWithdrawalStatus:
       type: string
-      enum: [pending_callback, queued, broadcast, confirmed, failed, refunded]
+      enum: [pending_callback, queued, broadcast, confirmed, refunded]
       description: |
         Lifecycle: `pending_callback` → (approval callback returns 2xx) → `queued` →
-        `broadcast` → `confirmed`. On callback rejection or permanent broadcast failure:
-        `failed` + `refunded` (sidecar re-credited, ledger reversed).
+        `broadcast` → `confirmed`. Any rejection, failure, or on-chain revert resolves to
+        `refunded` (funds returned to custody: sidecar re-credited, ledger reversed).
+        `refunded` is the single terminal failure state — there is no separate `failed` step.
 
     PayoutCryptoAddressResponse:
       type: object
@@ -769,17 +770,14 @@ components:
 
     PayoutQuoteResponse:
       type: object
-      required: [chain, token, amountCents, feeMultiplier, liveFeeUsdCents, liveTotalDebitCents, stats24h, computedAt]
+      required: [chain, token, amountCents, liveFeeUsdCents, liveTotalDebitCents, stats24h, computedAt]
       properties:
         chain: { type: string }
         token: { type: string }
         amountCents: { type: string }
-        feeMultiplier:
-          type: number
-          description: Admin-configurable multiplier on live gas (default 1.5).
         liveFeeUsdCents:
           type: string
-          description: Current network fee in USD cents (live gas × multiplier).
+          description: Current network fee in USD cents. `"0"` on L2 chains (Base, Arbitrum, Optimism).
         liveTotalDebitCents:
           type: string
           description: '`amountCents + liveFeeUsdCents` — what would be deducted from the payout custody if the partner submitted now.'
@@ -1006,7 +1004,7 @@ components:
         wear: { type: string }
         rarity: { type: string }
         rarityColor: { type: string }
-        category: { type: string, enum: [Normal, StatTrak, Souvenir] }
+        category: { type: string, enum: [Pistols, Rifles, Heavy, SMGs, Knives, Gloves, Equipment, Grenades, C4] }
         collection: { type: string }
         floatRange:
           type: array
@@ -2580,8 +2578,14 @@ paths:
       summary: Initiate a payout withdrawal
       description: |
         **Auth context:** merchant — **API key only** (JWT not accepted; this is the one
-        write endpoint in the payout group). Requires `cryptoPayoutEnabled=true` and at
-        least one active `CallbackUrl` registered for the merchant.
+        write endpoint in the payout group). Requires `cryptoPayoutEnabled=true`, a
+        provisioned webhook signing secret, and at least one active `CallbackUrl`
+        registered for the merchant.
+
+        > **Idempotent on `externalId`.** Retrying the same `externalId` returns the
+        > **original** withdrawal unchanged (idempotent replay) — it never double-spends
+        > or errors. The `1824` conflict is only returned on a genuine concurrent duplicate
+        > racing the first create.
 
         > **Withdrawals are per (chain, token), not from a single pool.** SkinShark does
         > not hold cross-chain liquidity. You can only withdraw from a chain × token
@@ -2596,14 +2600,18 @@ paths:
         2. Atomic transaction: sidecar decremented by `amountCents + liveFeeUsdCents`
            (rejected with `1822` if insufficient), `payout_withdraw_lock` ledger posting,
            withdrawal row created in `pending_callback`.
-        3. Synchronous approval callback POSTed to your `CallbackUrl` (5s timeout). Must
-           return 2xx. See **`payout.crypto.withdraw.approval`** in the webhook event
-           reference for the signed payload contract.
-        4. On 2xx → `queued` → `broadcast` → `confirmed`. On 4xx → immediate refund +
-           `failed` + `refunded` events. On 5xx/timeout/network → retry up to 3 times,
-           then refund.
-        5. Lifecycle events (`broadcast`, `confirmed`, `failed`, `refunded`) delivered
-           via the standard signed webhook queue.
+        3. Synchronous **approval call**: a signed POST of type
+           **`payout.crypto.withdraw.approval`** is sent to your `CallbackUrl` (5s timeout),
+           separate from the async lifecycle queue. Return **2xx to approve** (release funds)
+           or **4xx to reject**. The request carries `webhook-id`, `webhook-timestamp`, and
+           `webhook-signature` headers — the signature is **always present** (payouts require
+           a provisioned signing secret), so verify it before acting.
+        4. On 2xx → `queued` → `broadcast` → `confirmed`. On 4xx → immediate refund. On
+           5xx/timeout/network → retry up to 3 times, then refund. Any rejection, failure,
+           or on-chain revert resolves to the single terminal status `refunded`.
+        5. Lifecycle events (`payout.crypto.withdraw.broadcast`, `.confirmed`, and the
+           single terminal `.refunded`) are delivered asynchronously via the standard signed
+           webhook queue. There is no separate `.failed` delivery.
       requestBody:
         required: true
         content:
@@ -2626,12 +2634,14 @@ paths:
             `1820 CRYPTO_PAYOUT_NOT_ENABLED` — merchant flag is off.
         '409':
           description: |
-            `1824 CRYPTO_PAYOUT_DUPLICATE_EXTERNAL_ID` — `externalId` already used
-            for this merchant (idempotency violation).
+            `1824 CRYPTO_PAYOUT_DUPLICATE_EXTERNAL_ID` — only on a **genuine concurrent
+            duplicate** racing the first create. A normal retry of the same `externalId`
+            returns the original withdrawal with `200` (idempotent replay), not this error.
         '422':
           description: |
             One of:
-            - `1010 INVALID_AMOUNT` — `amountCents` not a positive integer.
+            - `1010 WITHDRAWAL_DAILY_LIMIT` — payout counts against the daily withdrawal cap.
+            - `1504 INVALID_AMOUNT` — `amountCents` is not a positive value.
             - `1803 CRYPTO_TOKEN_NOT_SUPPORTED` — token not in MVP allow-list for the chain.
             - `1806 CRYPTO_INVALID_DESTINATION` — destination is zero address, treasury,
               or one of the merchant's own forwarders.
@@ -2640,6 +2650,13 @@ paths:
             - `1823 CRYPTO_PAYOUT_NO_CALLBACK_URL` — no active `CallbackUrl` registered.
             - `1825 CRYPTO_PAYOUT_INVALID_SUBUSER` — `forSubUser` doesn't resolve to a
               sub-user of the calling merchant.
+            - `1827 CRYPTO_PAYOUT_NO_SIGNING_KEY` — a webhook signing secret must be
+              provisioned before requesting payouts (the approval call must be signable).
+        '503':
+          description: |
+            `1826 CRYPTO_PAYOUT_FEE_UNAVAILABLE` — the gas/price oracle is down on a
+            fee chain; retry shortly. (Also `1800 CRYPTO_NOT_CONFIGURED` if the crypto
+            gateway is not configured.)
 
   /user/wallet/payout/crypto/withdrawals:
     get:
@@ -2811,9 +2828,12 @@ paths:
         - { name: wear, in: query, schema: { type: string, maxLength: 50 } }
         - name: category
           in: query
-          schema: { type: string, enum: [Normal, StatTrak, Souvenir] }
+          schema: { type: string, enum: [Pistols, Rifles, Heavy, SMGs, Knives, Gloves, Equipment, Grenades, C4] }
         - { name: itemType, in: query, schema: { type: string, maxLength: 50 } }
-        - { name: tags, in: query, schema: { type: string, maxLength: 200 } }
+        - name: tags
+          in: query
+          description: Comma-separated item tag filter. `Normal` means no StatTrak/Souvenir tag.
+          schema: { type: string, enum: [Normal, StatTrak, Souvenir], maxLength: 200 }
         - { name: paintIndex, in: query, schema: { type: integer } }
         - { name: collection, in: query, schema: { type: string, maxLength: 200 } }
         - { name: priceMin, in: query, schema: { type: number, minimum: 0 } }

@@ -53,8 +53,7 @@ Partner crypto payout custody:
 - `payout.crypto.withdraw.approval` — **synchronous approval gate**, see below. Special delivery semantics.
 - `payout.crypto.withdraw.broadcast` — withdrawal broadcast on-chain. Includes `txHash` and `nonce`.
 - `payout.crypto.withdraw.confirmed` — final confirmation reached.
-- `payout.crypto.withdraw.failed` — terminally failed (approval rejected, or broadcast permanently failed).
-- `payout.crypto.withdraw.refunded` — sidecar re-credited, payout wallet restored. Always paired with `failed` — partners can rely on either to know funds returned.
+- `payout.crypto.withdraw.refunded` — the **single terminal failure event**: any approval rejection, broadcast failure, or on-chain revert re-credits the sidecar and restores the payout wallet. There is no separate `.failed` event.
 
 ## The approval callback — synchronous, not queued
 
@@ -118,7 +117,7 @@ If you simply forgot to register a callback URL, the withdrawal fails with `1823
 }
 ```
 
-The async lifecycle events (`payout.crypto.withdraw.broadcast`, `.confirmed`, `.failed`,
+The async lifecycle events (`payout.crypto.withdraw.broadcast`, `.confirmed`,
 `.refunded`) carry the **exact same** `data.withdrawal` shape — only `status`, `txHash`,
 `broadcastAt`, `confirmedAt`, and `failureReason` differ across the lifecycle.
 
@@ -143,7 +142,7 @@ interface WebhookEnvelope {
       }                                  // payout.crypto.deposit.completed
     | {
         withdrawal: PayoutWithdrawal;    // shape mirrors GET /payout/crypto/withdrawals/{id}
-      };                                 // payout.crypto.withdraw.{approval,broadcast,confirmed,failed,refunded}
+      };                                 // payout.crypto.withdraw.{approval,broadcast,confirmed,refunded}
 }
 ```
 
